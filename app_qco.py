@@ -359,6 +359,27 @@ HAS_UPDATED_AT = has_column(MASTER_SCHEMA, MASTER_TABLE, "updated_at")
 HAS_UPDATED_BY = has_column(MASTER_SCHEMA, MASTER_TABLE, "updated_by")
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def get_master_columns() -> Set[str]:
+    try:
+        df = fetch_df(
+            """
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = :schema
+              AND TABLE_NAME = :table;
+            """,
+            {"schema": MASTER_SCHEMA, "table": MASTER_TABLE},
+        )
+        return {str(x).strip() for x in df["COLUMN_NAME"].tolist()}
+    except Exception:
+        return set()
+
+
+def master_has_column(col: str) -> bool:
+    return col in get_master_columns()
+
+
 def normalize_for_compare(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in out.columns:
@@ -576,48 +597,57 @@ def get_master_df() -> pd.DataFrame:
 
 def update_master_fields_many(payload_rows: List[dict]) -> None:
     payload_rows = [truncate_fields(row, FIELD_MAX_LENGTHS) for row in payload_rows]
+
+    candidate_cols = [
+        "jira_summary",
+        "qc_overall_status",
+        "qc_investigation_status",
+        "qc_investigator",
+        "pre_check_date",
+        "check_meeting_date",
+        "remediation_meeting_date",
+        "reference_id",
+        "reference_date",
+        "email_after_pre_check",
+        "email_after_check_meeting",
+        "project_manager_id",
+        "project_manager_name",
+        "support_lead_id",
+        "support_lead_name",
+        "responsible_analyst_id",
+        "responsible_analyst_name",
+        "region",
+        "completed_date",
+        "summary_of_findings",
+        "check_meeting_comments",
+        "remediation_meeting_comments",
+    ]
+
+    set_clauses: List[str] = []
+    for col in candidate_cols:
+        if not master_has_column(col):
+            continue
+        if col == "jira_summary":
+            set_clauses.append("jira_summary = COALESCE(:jira_summary, jira_summary)")
+        else:
+            set_clauses.append(f"{col} = :{col}")
+
+    if master_has_column("updated_at"):
+        set_clauses.append("updated_at = SYSUTCDATETIME()")
+    if master_has_column("updated_by"):
+        set_clauses.append("updated_by = :updated_by")
+
+    if not set_clauses:
+        return
+
     sql = f"""
         UPDATE {T_MASTER}
-           SET
-               jira_summary = COALESCE(:jira_summary, jira_summary),
-
-               qc_overall_status = :qc_overall_status,
-               qc_investigation_status = :qc_investigation_status,
-               qc_investigator = :qc_investigator,
-
-               pre_check_date = :pre_check_date,
-               check_meeting_date = :check_meeting_date,
-               remediation_meeting_date = :remediation_meeting_date,
-
-               reference_id = :reference_id,
-               reference_date = :reference_date,
-
-               email_after_pre_check = :email_after_pre_check,
-               email_after_check_meeting = :email_after_check_meeting,
-
-               project_manager_id = :project_manager_id,
-               project_manager_name = :project_manager_name,
-               support_lead_id = :support_lead_id,
-               support_lead_name = :support_lead_name,
-               responsible_analyst_id = :responsible_analyst_id,
-               responsible_analyst_name = :responsible_analyst_name,
-
-               region = :region,
-               completed_date = :completed_date,
-
-               summary_of_findings = :summary_of_findings,
-               check_meeting_comments = :check_meeting_comments,
-               remediation_meeting_comments = :remediation_meeting_comments,
-
-               updated_at = SYSUTCDATETIME(),
-               updated_by = :updated_by
+           SET {", ".join(set_clauses)}
          WHERE jira_id = :jira_id;
     """
+
     with engine.begin() as conn:
-        conn.execute(
-            text(sql),
-            [{**row, "updated_by": current_user()} for row in payload_rows],
-        )
+        conn.execute(text(sql), [{**row, "updated_by": current_user()} for row in payload_rows])
 
 def truncate_fields(row, field_max_lengths):
     for field, max_len in field_max_lengths.items():
@@ -630,7 +660,7 @@ def truncate_fields(row, field_max_lengths):
 def update_master_partial(jira_id: str, fields: Dict[str, Any]) -> None:
     """
     Partial update used by Detail view callbacks (auto-sync between ID/Name/Region etc.).
-    Updates only provided keys (from the allowed set), plus updated_at/updated_by.
+    Updates only provided keys (from the allowed set), plus updated_at/updated_by when present.
     """
     allowed = {
         "qc_overall_status",
@@ -657,23 +687,26 @@ def update_master_partial(jira_id: str, fields: Dict[str, Any]) -> None:
     }
 
     fields = truncate_fields(fields, FIELD_MAX_LENGTHS)
-    cols = []
+    cols: List[str] = []
     params = {"jira_id": jira_id, "updated_by": current_user()}
 
     for k, v in fields.items():
-        if k not in allowed:
+        if k not in allowed or not master_has_column(k):
             continue
         cols.append(f"{k} = :{k}")
         params[k] = v
+
+    if master_has_column("updated_at"):
+        cols.append("updated_at = SYSUTCDATETIME()")
+    if master_has_column("updated_by"):
+        cols.append("updated_by = :updated_by")
 
     if not cols:
         return
 
     sql = f"""
         UPDATE {T_MASTER}
-           SET {", ".join(cols)},
-               updated_at = SYSUTCDATETIME(),
-               updated_by = :updated_by
+           SET {", ".join(cols)}
          WHERE jira_id = :jira_id;
     """
     exec_sql(sql, params)
@@ -1120,36 +1153,39 @@ def show_master_view() -> None:
                 flash_success("No valid rows to save.")
                 st.rerun()
 
-            # Preserve long-text fields on bulk save
+            # Preserve long-text fields on bulk save (only if columns exist)
             jira_ids = [p["jira_id"] for p in payload_rows]
-            stmt = (
-                text(
-                    f"""
-                    SELECT jira_id, summary_of_findings, check_meeting_comments, remediation_meeting_comments
-                    FROM {T_MASTER}
-                    WHERE jira_id IN :jira_ids
-                    """
+            long_text_cols = [
+                c
+                for c in ["summary_of_findings", "check_meeting_comments", "remediation_meeting_comments"]
+                if master_has_column(c)
+            ]
+
+            if long_text_cols:
+                select_cols = ", ".join(["jira_id"] + long_text_cols)
+                stmt = (
+                    text(
+                        f"""
+                        SELECT {select_cols}
+                        FROM {T_MASTER}
+                        WHERE jira_id IN :jira_ids
+                        """
+                    )
+                    .bindparams(bindparam("jira_ids", expanding=True))
                 )
-                .bindparams(bindparam("jira_ids", expanding=True))
-            )
 
-            with engine.begin() as conn:
-                existing = pd.read_sql(stmt, conn, params={"jira_ids": jira_ids})
+                with engine.begin() as conn:
+                    existing = pd.read_sql(stmt, conn, params={"jira_ids": jira_ids})
 
-            existing_map = {
-                _norm(row["jira_id"]): {
-                    "summary_of_findings": row.get("summary_of_findings"),
-                    "check_meeting_comments": row.get("check_meeting_comments"),
-                    "remediation_meeting_comments": row.get("remediation_meeting_comments"),
+                existing_map = {
+                    _norm(row["jira_id"]): {col: row.get(col) for col in long_text_cols}
+                    for _, row in existing.iterrows()
                 }
-                for _, row in existing.iterrows()
-            }
 
-            for p in payload_rows:
-                keep = existing_map.get(p["jira_id"], {})
-                p["summary_of_findings"] = keep.get("summary_of_findings")
-                p["check_meeting_comments"] = keep.get("check_meeting_comments")
-                p["remediation_meeting_comments"] = keep.get("remediation_meeting_comments")
+                for p in payload_rows:
+                    keep = existing_map.get(p["jira_id"], {})
+                    for col in long_text_cols:
+                        p[col] = keep.get(col)
 
             payload_rows = [truncate_fields(row, FIELD_MAX_LENGTHS) for row in payload_rows]
 
