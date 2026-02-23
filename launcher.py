@@ -14,8 +14,9 @@ BASE_DIR = Path(__file__).resolve().parent
 APP_FILE = BASE_DIR / "app_qco.py"
 REQ_FILE = BASE_DIR / "requirements.txt"
 
-VENV_DIR = BASE_DIR / "venv"
-VENV_PY = VENV_DIR / "Scripts" / "python.exe"  # Windows
+DEFAULT_VENV_DIR = BASE_DIR / "venv"
+
+STATE_DIR = BASE_DIR / ".launcher_state"
 
 # Your corporate CA bundle
 CERT_FILE = BASE_DIR / "certs" / "HSBC_CA_bundle.pem"
@@ -23,7 +24,7 @@ CERT_FILE = BASE_DIR / "certs" / "HSBC_CA_bundle.pem"
 STREAMLIT_PORT = "8501"
 STREAMLIT_ADDR = "127.0.0.1"
 
-REQ_HASH_FILE = VENV_DIR / ".requirements.sha256"
+REQ_HASH_FILE = STATE_DIR / ".requirements.sha256"
 REQ_GEN_HASH_FILE = BASE_DIR / ".app_imports.sha256"  # tracks app_qco.py hash used for requirements generation
 
 
@@ -180,15 +181,44 @@ def generate_requirements_from_app() -> None:
 # -------------------------------------------------
 # VENV + INSTALL
 # -------------------------------------------------
-def ensure_venv() -> None:
-    if VENV_PY.exists():
-        return
+def venv_python_candidates(venv_dir: Path) -> List[Path]:
+    return [
+        venv_dir / "Scripts" / "python.exe",  # Windows
+        venv_dir / "Scripts" / "python",      # Windows alternative
+        venv_dir / "bin" / "python",          # Linux/macOS
+    ]
 
-    print("[INFO] venv not found. Creating virtual environment...")
-    run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
 
-    if not VENV_PY.exists():
-        raise SystemExit(f"[ERROR] venv created but python not found at: {VENV_PY}")
+def find_python_in_venv_dir(venv_dir: Path) -> Optional[Path]:
+    for candidate in venv_python_candidates(venv_dir):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def ensure_venv_python() -> Path:
+    # 1) Reuse currently activated virtual env when available.
+    active_venv = os.environ.get("VIRTUAL_ENV", "").strip()
+    if active_venv:
+        active_py = find_python_in_venv_dir(Path(active_venv))
+        if active_py:
+            print(f"[INFO] Using active virtual environment: {active_venv}")
+            return active_py
+
+    # 2) Reuse local project environments if present.
+    for candidate_dir in (BASE_DIR / "venv", BASE_DIR / ".venv"):
+        existing = find_python_in_venv_dir(candidate_dir)
+        if existing:
+            print(f"[INFO] Using existing virtual environment: {candidate_dir}")
+            return existing
+
+    # 3) No venv found: create one.
+    print(f"[INFO] No virtual environment found. Creating one at: {DEFAULT_VENV_DIR}")
+    run([sys.executable, "-m", "venv", str(DEFAULT_VENV_DIR)], check=True)
+    created = find_python_in_venv_dir(DEFAULT_VENV_DIR)
+    if not created:
+        raise SystemExit(f"[ERROR] venv created but python not found in: {DEFAULT_VENV_DIR}")
+    return created
 
 
 def parse_requirements(path: Path) -> List[str]:
@@ -249,8 +279,8 @@ def split_pip_global_options(entries: List[str]) -> Tuple[List[str], List[str]]:
     return globals_, targets
 
 
-def pip_install_one(target: str, global_opts: List[str]) -> bool:
-    cmd = [str(VENV_PY), "-m", "pip", "install"]
+def pip_install_one(venv_python: Path, target: str, global_opts: List[str]) -> bool:
+    cmd = [str(venv_python), "-m", "pip", "install"]
     for opt in global_opts:
         cmd.extend(opt.split())
     cmd.append(target)
@@ -259,13 +289,14 @@ def pip_install_one(target: str, global_opts: List[str]) -> bool:
     return code == 0
 
 
-def ensure_requirements_installed() -> None:
+def ensure_requirements_installed(venv_python: Path) -> None:
     if not REQ_FILE.exists():
         raise SystemExit(f"[ERROR] requirements.txt not found: {REQ_FILE}")
 
     current_hash = sha256_file(REQ_FILE)
 
-    failed_file = VENV_DIR / ".requirements_failed.txt"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    failed_file = STATE_DIR / ".requirements_failed.txt"
     had_prev_failures = failed_file.exists() and failed_file.read_text(encoding="utf-8").strip() != ""
 
     if REQ_HASH_FILE.exists() and REQ_HASH_FILE.read_text(encoding="utf-8").strip() == current_hash and not had_prev_failures:
@@ -273,8 +304,8 @@ def ensure_requirements_installed() -> None:
         return
 
     print("[INFO] Installing/updating dependencies from requirements.txt...")
-    run([str(VENV_PY), "-m", "pip", "install", "--upgrade", "pip"], check=False)
-    run([str(VENV_PY), "-m", "pip", "install", "--upgrade", "setuptools", "wheel"], check=False)
+    run([str(venv_python), "-m", "pip", "install", "--upgrade", "pip"], check=False)
+    run([str(venv_python), "-m", "pip", "install", "--upgrade", "setuptools", "wheel"], check=False)
 
     entries = parse_requirements(REQ_FILE)
     global_opts, targets = split_pip_global_options(entries)
@@ -282,12 +313,11 @@ def ensure_requirements_installed() -> None:
     failed: List[str] = []
     for t in targets:
         print(f"[INFO] pip install {t}")
-        ok = pip_install_one(t, global_opts=global_opts)
+        ok = pip_install_one(venv_python, t, global_opts=global_opts)
         if not ok:
             print(f"[WARN] Skipped (failed): {t}")
             failed.append(t)
 
-    REQ_HASH_FILE.parent.mkdir(parents=True, exist_ok=True)
     REQ_HASH_FILE.write_text(current_hash, encoding="utf-8")
 
     if failed:
@@ -303,7 +333,7 @@ def ensure_requirements_installed() -> None:
 
     # Optional: freeze lock for support/debug (not used automatically)
     try:
-        lock = run([str(VENV_PY), "-m", "pip", "freeze"], check=False)
+        lock = run([str(venv_python), "-m", "pip", "freeze"], check=False)
         _ = lock
     except Exception:
         pass
@@ -325,14 +355,14 @@ def build_env_with_cert() -> dict:
     return env
 
 
-def run_streamlit() -> None:
+def run_streamlit(venv_python: Path) -> None:
     if not APP_FILE.exists():
         raise SystemExit(f"[ERROR] app_qco.py not found: {APP_FILE}")
 
     env = build_env_with_cert()
 
     cmd = [
-        str(VENV_PY),
+        str(venv_python),
         "-m",
         "streamlit",
         "run",
@@ -355,13 +385,13 @@ def main() -> None:
         print("[INFO] requirements.txt up-to-date (no regeneration needed).")
 
     # 2) Ensure venv
-    ensure_venv()
+    venv_python = ensure_venv_python()
 
     # 3) Install deps
-    ensure_requirements_installed()
+    ensure_requirements_installed(venv_python)
 
     # 4) Run app
-    run_streamlit()
+    run_streamlit(venv_python)
 
 
 if __name__ == "__main__":
