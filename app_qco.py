@@ -172,7 +172,7 @@ DB_SCHEMA = "dbo"
 T_MASTER = f"{DB_SCHEMA}.qco_master"
 T_CATALOG = f"{DB_SCHEMA}.qco_check_catalog"
 T_GRADES = f"{DB_SCHEMA}.qco_check_grades"
-T_EMP = f"{DB_SCHEMA}.qco_employees"
+T_EMP_CANDIDATES = [f"{DB_SCHEMA}.qco_staff", f"{DB_SCHEMA}.qco_employees"]
 
 
 # ============================================================
@@ -475,21 +475,68 @@ def normalize_for_compare(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 @st.cache_data(show_spinner=False, ttl=600)
 def get_employees_maps() -> dict:
-    df = fetch_df(
-        f"""
-        SELECT
-            LTRIM(RTRIM([Employee Name])) AS employee_name,
-            CAST([Employee ID] AS varchar(100)) AS employee_id,
-            LTRIM(RTRIM([Region])) AS region
-        FROM {T_EMP}
-        WHERE [Employee ID] IS NOT NULL
-          AND [Employee Name] IS NOT NULL;
-        """
-    )
+    queries = [
+        # Preferred source requested by users
+        (
+            T_EMP_CANDIDATES[0],
+            """
+            SELECT
+                LTRIM(RTRIM(CAST([employee_name] AS nvarchar(4000)))) AS employee_name,
+                LTRIM(RTRIM(CAST([employee_id] AS varchar(100)))) AS employee_id,
+                LTRIM(RTRIM(CAST([region] AS nvarchar(4000)))) AS region
+            FROM {table}
+            WHERE [employee_id] IS NOT NULL
+              AND [employee_name] IS NOT NULL;
+            """,
+        ),
+        (
+            T_EMP_CANDIDATES[0],
+            """
+            SELECT
+                LTRIM(RTRIM(CAST([Employee Name] AS nvarchar(4000)))) AS employee_name,
+                LTRIM(RTRIM(CAST([Employee ID] AS varchar(100)))) AS employee_id,
+                LTRIM(RTRIM(CAST([Region] AS nvarchar(4000)))) AS region
+            FROM {table}
+            WHERE [Employee ID] IS NOT NULL
+              AND [Employee Name] IS NOT NULL;
+            """,
+        ),
+        (
+            T_EMP_CANDIDATES[1],
+            """
+            SELECT
+                LTRIM(RTRIM(CAST([Employee Name] AS nvarchar(4000)))) AS employee_name,
+                LTRIM(RTRIM(CAST([Employee ID] AS varchar(100)))) AS employee_id,
+                LTRIM(RTRIM(CAST([Region] AS nvarchar(4000)))) AS region
+            FROM {table}
+            WHERE [Employee ID] IS NOT NULL
+              AND [Employee Name] IS NOT NULL;
+            """,
+        ),
+    ]
+
+    last_err = None
+    df = pd.DataFrame(columns=["employee_name", "employee_id", "region"])
+    for table, sql_tpl in queries:
+        try:
+            df = fetch_df(sql_tpl.format(table=table))
+            if not df.empty:
+                break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if df.empty and last_err is not None:
+        print(f"[WARN] Could not load employee maps: {last_err}")
+
+    if df.empty:
+        return {"name_to_id": {}, "id_to_name": {}, "id_to_region": {}, "names_sorted": []}
 
     df["employee_name"] = df["employee_name"].astype(str).str.strip()
     df["employee_id"] = df["employee_id"].astype(str).str.strip()
     df["region"] = df["region"].astype(str).str.strip()
+
+    df = df[(df["employee_name"] != "") & (df["employee_id"] != "")]
 
     name_to_id = {n.lower(): i for n, i in zip(df["employee_name"], df["employee_id"])}
     id_to_name = {i: n for n, i in zip(df["employee_name"], df["employee_id"])}
@@ -503,6 +550,39 @@ def get_employees_maps() -> dict:
         "id_to_region": id_to_region,
         "names_sorted": names_sorted,
     }
+
+
+def _df_equal_loose(a: pd.DataFrame, b: pd.DataFrame) -> bool:
+    if list(a.columns) != list(b.columns) or len(a) != len(b):
+        return False
+    aa = a.fillna("").astype(str)
+    bb = b.fillna("").astype(str)
+    return aa.equals(bb)
+
+
+def apply_master_autofill(df_display: pd.DataFrame, maps: dict) -> pd.DataFrame:
+    out = df_display.copy()
+    for i, r in out.iterrows():
+        row = {
+            "project_manager_id": _norm(r.get("Project Manager ID", "")) or None,
+            "project_manager_name": _norm(r.get("Project Manager Name", "")) or None,
+            "support_lead_id": _norm(r.get("Support Lead ID", "")) or None,
+            "support_lead_name": _norm(r.get("Support Lead Name", "")) or None,
+            "responsible_analyst_id": _norm(r.get("Responsible Analyst ID", "")) or None,
+            "responsible_analyst_name": _norm(r.get("Responsible Analyst Name", "")) or None,
+            "region": _norm(r.get("Region", "")) or None,
+        }
+        row = sync_person_row_fields(row, maps)
+
+        out.at[i, "Project Manager ID"] = row.get("project_manager_id") or ""
+        out.at[i, "Project Manager Name"] = row.get("project_manager_name") or ""
+        out.at[i, "Support Lead ID"] = row.get("support_lead_id") or ""
+        out.at[i, "Support Lead Name"] = row.get("support_lead_name") or ""
+        out.at[i, "Responsible Analyst ID"] = row.get("responsible_analyst_id") or ""
+        out.at[i, "Responsible Analyst Name"] = row.get("responsible_analyst_name") or ""
+        out.at[i, "Region"] = row.get("region") or ""
+
+    return out
 
 
 def sync_person_fields(prefix: str, maps: dict, also_region_from_support_lead: bool = False) -> None:
@@ -1221,12 +1301,33 @@ def show_master_view() -> None:
 
     st.subheader("JIRA Master List")
 
-    df_before_edit = df_show.copy(deep=True)
-    edited_df = build_master_grid(df_show, display_to_internal)
-    edited_sanitized = enforce_master_display_limits(edited_df, display_to_internal)
-    if not edited_sanitized.equals(edited_df):
-        st.info("Some pasted text exceeded DB field limits and was automatically truncated.")
+    grid_state_key = "master_grid_working"
+    grid_key_state = "master_grid_view_key"
+    current_view_key = "|".join(df_show["JIRA ID"].astype(str).tolist())
+
+    if st.session_state.get(grid_key_state) != current_view_key:
+        st.session_state[grid_state_key] = df_show.copy(deep=True)
+        st.session_state[grid_key_state] = current_view_key
+
+    grid_input = st.session_state.get(grid_state_key, df_show.copy(deep=True))
+    if not isinstance(grid_input, pd.DataFrame):
+        grid_input = df_show.copy(deep=True)
+
+    df_before_edit = grid_input.copy(deep=True)
+    edited_df = build_master_grid(grid_input, display_to_internal)
+
+    maps = get_employees_maps()
+    edited_autofilled = apply_master_autofill(edited_df, maps)
+    edited_sanitized = enforce_master_display_limits(edited_autofilled, display_to_internal)
+
+    if not _df_equal_loose(edited_sanitized, edited_df):
+        st.session_state[grid_state_key] = edited_sanitized
+        st.session_state[grid_key_state] = current_view_key
+        st.info("People fields were auto-synced (ID/Name/Region) and overlong text was truncated.")
+        st.rerun()
+
     edited_df = edited_sanitized
+    st.session_state[grid_state_key] = edited_df.copy(deep=True)
 
     csave1, _ = st.columns([1, 6])
     with csave1:
