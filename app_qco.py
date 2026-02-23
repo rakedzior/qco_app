@@ -563,15 +563,6 @@ def _df_equal_loose(a: pd.DataFrame, b: pd.DataFrame) -> bool:
     return aa.equals(bb)
 
 
-def _master_view_signature(df: pd.DataFrame) -> str:
-    """Stable lightweight signature for current master grid view content."""
-    if "JIRA ID" not in df.columns:
-        return f"rows:{len(df)}"
-    ids = df["JIRA ID"].fillna("").astype(str)
-    hashed = int(pd.util.hash_pandas_object(ids, index=False).sum())
-    return f"rows:{len(ids)}|hash:{hashed}"
-
-
 def apply_master_autofill(df_display: pd.DataFrame, maps: dict) -> pd.DataFrame:
     out = df_display.copy()
     for i, r in out.iterrows():
@@ -1332,7 +1323,7 @@ def show_master_view() -> None:
 
     grid_state_key = "master_grid_working"
     grid_key_state = "master_grid_view_key"
-    current_view_key = _master_view_signature(df_show)
+    current_view_key = "|".join(df_show["JIRA ID"].astype(str).tolist())
 
     if st.session_state.get(grid_key_state) != current_view_key:
         st.session_state[grid_state_key] = df_show.copy(deep=True)
@@ -1347,19 +1338,15 @@ def show_master_view() -> None:
     df_before_edit = grid_input.copy(deep=True)
     edited_df = build_master_grid(grid_input, display_to_internal, maps.get("names_sorted", []))
 
-    edited_sanitized = enforce_master_display_limits(edited_df, display_to_internal)
-    grid_changed = not _df_equal_loose(edited_sanitized, df_before_edit)
+    if len(edited_df) <= MASTER_AUTOFILL_MAX_ROWS:
+        edited_autofilled = apply_master_autofill(edited_df, maps)
+    else:
+        edited_autofilled = edited_df
+        st.caption(f"Autosync ID/Region in grid preview is limited to first {MASTER_AUTOFILL_MAX_ROWS} rows for performance; Save still syncs all changed rows.")
 
-    if grid_changed:
-        if len(edited_sanitized) <= MASTER_AUTOFILL_MAX_ROWS:
-            edited_sanitized = apply_master_autofill(edited_sanitized, maps)
-            edited_sanitized = enforce_master_display_limits(edited_sanitized, display_to_internal)
-        else:
-            st.caption(
-                f"Autosync ID/Region in grid preview is limited to first {MASTER_AUTOFILL_MAX_ROWS} rows for performance; Save still syncs all changed rows."
-            )
+    edited_sanitized = enforce_master_display_limits(edited_autofilled, display_to_internal)
 
-    if grid_changed and not _df_equal_loose(edited_sanitized, edited_df):
+    if not _df_equal_loose(edited_sanitized, edited_df):
         st.session_state[grid_state_key] = edited_sanitized
         st.session_state[grid_key_state] = current_view_key
         st.info("People fields were auto-synced (ID/Name/Region) and overlong text was truncated.")
