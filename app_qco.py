@@ -67,6 +67,9 @@ QC_OVERALL_STATUS_OPTIONS = [
 ]
 YES_NO_OPTIONS = ["No", "Yes"]
 
+# Performance guards (Python-only optimization, no SQL changes)
+MASTER_AUTOFILL_MAX_ROWS = 400
+
 JIRA_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]+-\d+$")
 
 
@@ -710,6 +713,27 @@ class LinkRenderer {
 """
 )
 
+JIRA_ID_RENDERER_JS = JsCode(
+    """
+class JiraIdRenderer {
+  init(params) {
+    this.eGui = document.createElement('a');
+    const jiraId = (params.value || '').toString();
+    if (jiraId) {
+      const targetUrl = `${window.location.pathname}?page=detail&jira_id=${encodeURIComponent(jiraId)}`;
+      this.eGui.href = targetUrl;
+      this.eGui.innerText = jiraId;
+      this.eGui.style.color = '#1a73e8';
+      this.eGui.style.textDecoration = 'underline';
+    } else {
+      this.eGui.innerText = '';
+    }
+  }
+  getGui() { return this.eGui; }
+}
+"""
+)
+
 
 # ============================================================
 # PRE-POPULATE GRADES
@@ -1014,7 +1038,7 @@ def _apply_master_filters(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # MASTER GRID
 # ============================================================
-def build_master_grid(df_display: pd.DataFrame, display_to_internal: Dict[str, str]) -> pd.DataFrame:
+def build_master_grid(df_display: pd.DataFrame, display_to_internal: Dict[str, str], name_options: List[str]) -> pd.DataFrame:
     gb = GridOptionsBuilder.from_dataframe(df_display)
 
     gb.configure_default_column(
@@ -1022,10 +1046,11 @@ def build_master_grid(df_display: pd.DataFrame, display_to_internal: Dict[str, s
         sortable=True,
         filter=True,
         editable=False,
-        wrapText=True,
-        autoHeight=True,
+        wrapText=False,
+        autoHeight=False,
     )
 
+    gb.configure_column("JIRA ID", cellRenderer="JiraIdRenderer", editable=False)
     gb.configure_column("JIRA Link", cellRenderer="LinkRenderer", editable=False)
 
     if "QC Overall Status" in df_display.columns:
@@ -1063,13 +1088,6 @@ def build_master_grid(df_display: pd.DataFrame, display_to_internal: Dict[str, s
     editable_text_cols = [
         "QC Investigator",
         "Reference ID",
-        "Project Manager ID",
-        "Project Manager Name",
-        "Support Lead ID",
-        "Support Lead Name",
-        "Responsible Analyst ID",
-        "Responsible Analyst Name",
-        "Region",
     ]
     for c in editable_text_cols:
         if c in df_display.columns:
@@ -1079,6 +1097,19 @@ def build_master_grid(df_display: pd.DataFrame, display_to_internal: Dict[str, s
             if max_len:
                 col_cfg["cellEditorParams"] = {"maxLength": int(max_len)}
             gb.configure_column(c, **col_cfg)
+
+    for c in ["Project Manager ID", "Support Lead ID", "Responsible Analyst ID", "Region"]:
+        if c in df_display.columns:
+            gb.configure_column(c, editable=False)
+
+    for c in ["Project Manager Name", "Support Lead Name", "Responsible Analyst Name"]:
+        if c in df_display.columns:
+            gb.configure_column(
+                c,
+                editable=True,
+                cellEditor="agSelectCellEditor",
+                cellEditorParams={"values": [""] + name_options},
+            )
 
     editable_date_cols = [
         "Reference Date",
@@ -1092,26 +1123,15 @@ def build_master_grid(df_display: pd.DataFrame, display_to_internal: Dict[str, s
             gb.configure_column(c, editable=True)
 
     grid_options = gb.build()
-    grid_options["components"] = {"LinkRenderer": LINK_RENDERER_JS}
+    grid_options["components"] = {"LinkRenderer": LINK_RENDERER_JS, "JiraIdRenderer": JIRA_ID_RENDERER_JS}
     grid_options["headerHeight"] = 64
     grid_options["groupHeaderHeight"] = 64
-    grid_options["onFirstDataRendered"] = JsCode(
-        """
-    function(params) {
-        const allColumnIds = [];
-        params.columnApi.getAllColumns().forEach(col => {
-            allColumnIds.push(col.getId());
-        });
-        params.columnApi.autoSizeColumns(allColumnIds, false);
-    }
-    """
-    )
 
     resp = AgGrid(
         df_display,
         gridOptions=grid_options,
         height=560,
-        fit_columns_on_grid_load=False,
+        fit_columns_on_grid_load=True,
         update_mode=GridUpdateMode.VALUE_CHANGED,
         data_return_mode=DataReturnMode.AS_INPUT,
         allow_unsafe_jscode=True,
@@ -1313,18 +1333,23 @@ def show_master_view() -> None:
     if not isinstance(grid_input, pd.DataFrame):
         grid_input = df_show.copy(deep=True)
 
-    df_before_edit = grid_input.copy(deep=True)
-    edited_df = build_master_grid(grid_input, display_to_internal)
-
     maps = get_employees_maps()
-    edited_autofilled = apply_master_autofill(edited_df, maps)
+
+    df_before_edit = grid_input.copy(deep=True)
+    edited_df = build_master_grid(grid_input, display_to_internal, maps.get("names_sorted", []))
+
+    if len(edited_df) <= MASTER_AUTOFILL_MAX_ROWS:
+        edited_autofilled = apply_master_autofill(edited_df, maps)
+    else:
+        edited_autofilled = edited_df
+        st.caption(f"Autosync ID/Region in grid preview is limited to first {MASTER_AUTOFILL_MAX_ROWS} rows for performance; Save still syncs all changed rows.")
+
     edited_sanitized = enforce_master_display_limits(edited_autofilled, display_to_internal)
 
     if not _df_equal_loose(edited_sanitized, edited_df):
         st.session_state[grid_state_key] = edited_sanitized
         st.session_state[grid_key_state] = current_view_key
         st.info("People fields were auto-synced (ID/Name/Region) and overlong text was truncated.")
-        st.rerun()
 
     edited_df = edited_sanitized
     st.session_state[grid_state_key] = edited_df.copy(deep=True)
@@ -1337,12 +1362,8 @@ def show_master_view() -> None:
 
             edited_n = edited_n[base_df.columns]
 
-            def _row_sig(r: pd.Series) -> str:
-                return "||".join([str(x) for x in r.values.tolist()])
-
-            base_sig = base_df.apply(_row_sig, axis=1)
-            edit_sig = edited_n.apply(_row_sig, axis=1)
-            changed = edited_df.loc[base_sig.ne(edit_sig)].copy()
+            changed_mask = ~(base_df.eq(edited_n)).all(axis=1)
+            changed = edited_df.loc[changed_mask].copy()
 
             if changed.empty:
                 flash_success("No changes to save.")
@@ -1505,7 +1526,7 @@ def build_checks_editor_grid(df_checks: pd.DataFrame) -> pd.DataFrame:
     df_edit = df_edit[display_cols]
 
     gb = GridOptionsBuilder.from_dataframe(df_edit)
-    gb.configure_default_column(resizable=True, sortable=True, filter=False, editable=False, wrapText=True, autoHeight=True)
+    gb.configure_default_column(resizable=True, sortable=True, filter=False, editable=False, wrapText=False, autoHeight=False)
 
     gb.configure_column("check_id", header_name="check_id", hide=True)
     gb.configure_column("check_name", header_name="Check Name", editable=False)
@@ -1689,14 +1710,14 @@ def show_detail_view(jira_id: str) -> None:
 
     p1, p2, p3 = st.columns(3)
     with p1:
-        st.text_input("Project Manager ID", key="project_manager_id", on_change=_on_pm_change)
+        st.text_input("Project Manager ID", key="project_manager_id", disabled=True)
         st.selectbox("Project Manager Name", options=names, key="project_manager_name", on_change=_on_pm_change)
     with p2:
-        st.text_input("Support Lead ID", key="support_lead_id", on_change=_on_sl_change)
+        st.text_input("Support Lead ID", key="support_lead_id", disabled=True)
         st.selectbox("Support Lead Name", options=names, key="support_lead_name", on_change=_on_sl_change)
         st.caption("Region auto-sync from Support Lead.")
     with p3:
-        st.text_input("Responsible Analyst ID", key="responsible_analyst_id", on_change=_on_ra_change)
+        st.text_input("Responsible Analyst ID", key="responsible_analyst_id", disabled=True)
         st.selectbox("Responsible Analyst Name", options=names, key="responsible_analyst_name", on_change=_on_ra_change)
 
     st.divider()
