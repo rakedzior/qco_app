@@ -175,7 +175,7 @@ DB_SCHEMA = "dbo"
 T_MASTER = f"{DB_SCHEMA}.qco_master"
 T_CATALOG = f"{DB_SCHEMA}.qco_check_catalog"
 T_GRADES = f"{DB_SCHEMA}.qco_check_grades"
-T_EMP_CANDIDATES = [f"{DB_SCHEMA}.qco_staff", f"{DB_SCHEMA}.qco_employees"]
+T_EMPLOYEE_SOURCE = f"{DB_SCHEMA}.qco_staff"
 
 
 # ============================================================
@@ -479,9 +479,9 @@ def normalize_for_compare(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(show_spinner=False, ttl=600)
 def get_employees_maps() -> dict:
     queries = [
-        # Preferred source requested by users
+        # Source of truth for people mapping
         (
-            T_EMP_CANDIDATES[0],
+            T_EMPLOYEE_SOURCE,
             """
             SELECT
                 LTRIM(RTRIM(CAST([employee_name] AS nvarchar(4000)))) AS employee_name,
@@ -493,19 +493,7 @@ def get_employees_maps() -> dict:
             """,
         ),
         (
-            T_EMP_CANDIDATES[0],
-            """
-            SELECT
-                LTRIM(RTRIM(CAST([Employee Name] AS nvarchar(4000)))) AS employee_name,
-                LTRIM(RTRIM(CAST([Employee ID] AS varchar(100)))) AS employee_id,
-                LTRIM(RTRIM(CAST([Region] AS nvarchar(4000)))) AS region
-            FROM {table}
-            WHERE [Employee ID] IS NOT NULL
-              AND [Employee Name] IS NOT NULL;
-            """,
-        ),
-        (
-            T_EMP_CANDIDATES[1],
+            T_EMPLOYEE_SOURCE,
             """
             SELECT
                 LTRIM(RTRIM(CAST([Employee Name] AS nvarchar(4000)))) AS employee_name,
@@ -730,6 +718,18 @@ class JiraIdRenderer {
     }
   }
   getGui() { return this.eGui; }
+}
+"""
+)
+
+AUTOSIZE_COLUMNS_JS = JsCode(
+    """
+function(params) {
+  const allCols = [];
+  params.columnApi.getColumns().forEach((col) => allCols.push(col.getId()));
+  if (allCols.length > 0) {
+    params.columnApi.autoSizeColumns(allCols, false);
+  }
 }
 """
 )
@@ -1126,13 +1126,15 @@ def build_master_grid(df_display: pd.DataFrame, display_to_internal: Dict[str, s
     grid_options["components"] = {"LinkRenderer": LINK_RENDERER_JS, "JiraIdRenderer": JIRA_ID_RENDERER_JS}
     grid_options["headerHeight"] = 64
     grid_options["groupHeaderHeight"] = 64
+    grid_options["onFirstDataRendered"] = AUTOSIZE_COLUMNS_JS
+    grid_options["suppressSizeToFit"] = True
 
     resp = AgGrid(
         df_display,
         gridOptions=grid_options,
         height=560,
-        fit_columns_on_grid_load=True,
-        update_mode=GridUpdateMode.VALUE_CHANGED,
+        fit_columns_on_grid_load=False,
+        update_mode=GridUpdateMode.MANUAL,
         data_return_mode=DataReturnMode.AS_INPUT,
         allow_unsafe_jscode=True,
         theme="balham",
