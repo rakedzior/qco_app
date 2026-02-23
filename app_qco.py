@@ -541,6 +541,45 @@ def sync_person_fields(prefix: str, maps: dict, also_region_from_support_lead: b
             st.session_state["region"] = ""
 
 
+def sync_person_row_fields(row: Dict[str, Any], maps: dict) -> Dict[str, Any]:
+    out = dict(row)
+    name_to_id = maps["name_to_id"]
+    id_to_name = maps["id_to_name"]
+    id_to_region = maps["id_to_region"]
+
+    def _sync_pair(id_key: str, name_key: str) -> None:
+        emp_id = _norm(out.get(id_key, ""))
+        emp_name = _norm(out.get(name_key, ""))
+
+        if emp_id:
+            if emp_id in id_to_name:
+                out[name_key] = id_to_name[emp_id]
+            return
+
+        if emp_name:
+            mapped_id = name_to_id.get(emp_name.lower())
+            if mapped_id:
+                out[id_key] = mapped_id
+
+    _sync_pair("project_manager_id", "project_manager_name")
+    _sync_pair("support_lead_id", "support_lead_name")
+    _sync_pair("responsible_analyst_id", "responsible_analyst_name")
+
+    support_lead_id = _norm(out.get("support_lead_id", ""))
+    if support_lead_id:
+        out["region"] = id_to_region.get(support_lead_id) or None
+    else:
+        support_lead_name = _norm(out.get("support_lead_name", ""))
+        mapped_id = name_to_id.get(support_lead_name.lower()) if support_lead_name else None
+        if mapped_id:
+            out["support_lead_id"] = mapped_id
+            out["region"] = id_to_region.get(mapped_id) or None
+        elif not support_lead_name:
+            out["region"] = None
+
+    return out
+
+
 # ============================================================
 # AGGRID JS
 # ============================================================
@@ -1208,6 +1247,8 @@ def show_master_view() -> None:
                 flash_success("No changes to save.")
                 st.rerun()
 
+            maps = get_employees_maps()
+
             payload_rows: List[dict] = []
             for _, r in changed.iterrows():
                 jira_id = _norm(r.get("JIRA ID", ""))
@@ -1238,6 +1279,9 @@ def show_master_view() -> None:
                     "check_meeting_comments": None,
                     "remediation_meeting_comments": None,
                 }
+
+                # Autofill ID/Name/Region in master save path (mirrors detail-view behavior)
+                row = sync_person_row_fields(row, maps)
 
                 # Truncate fields before appending
                 row = truncate_fields(row, FIELD_MAX_LENGTHS)
