@@ -359,6 +359,107 @@ HAS_UPDATED_AT = has_column(MASTER_SCHEMA, MASTER_TABLE, "updated_at")
 HAS_UPDATED_BY = has_column(MASTER_SCHEMA, MASTER_TABLE, "updated_by")
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def get_master_columns() -> Set[str]:
+    try:
+        df = fetch_df(
+            """
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = :schema
+              AND TABLE_NAME = :table;
+            """,
+            {"schema": MASTER_SCHEMA, "table": MASTER_TABLE},
+        )
+        return {str(x).strip() for x in df["COLUMN_NAME"].tolist()}
+    except Exception:
+        return set()
+
+
+def master_has_column(col: str) -> bool:
+    return col in get_master_columns()
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def get_master_char_limits() -> Dict[str, int]:
+    try:
+        df = fetch_df(
+            """
+            SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = :schema
+              AND TABLE_NAME = :table
+              AND CHARACTER_MAXIMUM_LENGTH IS NOT NULL;
+            """,
+            {"schema": MASTER_SCHEMA, "table": MASTER_TABLE},
+        )
+        limits: Dict[str, int] = {}
+        for _, row in df.iterrows():
+            col = str(row.get("COLUMN_NAME") or "").strip()
+            max_len = row.get("CHARACTER_MAXIMUM_LENGTH")
+            if not col or max_len in (None, -1):
+                continue
+            try:
+                limits[col] = int(max_len)
+            except Exception:
+                continue
+        return limits
+    except Exception:
+        return {}
+
+
+def truncate_master_row_to_db_limits(row: Dict[str, Any]) -> Dict[str, Any]:
+    limits = get_master_char_limits()
+    if not limits:
+        return row
+
+    out = dict(row)
+    for field, val in out.items():
+        if not isinstance(val, str):
+            continue
+        db_max = limits.get(field)
+        cfg_max = FIELD_MAX_LENGTHS.get(field)
+
+        if db_max is None and cfg_max is None:
+            continue
+
+        effective_max = db_max if cfg_max is None else min(db_max or cfg_max, cfg_max)
+        if effective_max is not None and len(val) > effective_max:
+            print(f"Truncating field {field}: {len(val)} -> {effective_max}")
+            out[field] = val[:effective_max]
+
+    return out
+
+
+def get_effective_master_limit(col: str) -> Optional[int]:
+    db_max = get_master_char_limits().get(col)
+    cfg_max = FIELD_MAX_LENGTHS.get(col)
+
+    if db_max is None and cfg_max is None:
+        return None
+    if db_max is None:
+        return cfg_max
+    if cfg_max is None:
+        return db_max
+    return min(db_max, cfg_max)
+
+
+def enforce_master_display_limits(df_display: pd.DataFrame, display_to_internal: Dict[str, str]) -> pd.DataFrame:
+    out = df_display.copy()
+    for display_col, internal_col in display_to_internal.items():
+        if display_col not in out.columns:
+            continue
+        limit = get_effective_master_limit(internal_col)
+        if not limit:
+            continue
+
+        out[display_col] = out[display_col].apply(
+            lambda v: v if (not isinstance(v, str) or len(v) <= limit) else v[:limit]
+        )
+
+    return out
+
+
 def normalize_for_compare(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in out.columns:
@@ -438,6 +539,45 @@ def sync_person_fields(prefix: str, maps: dict, also_region_from_support_lead: b
         st.session_state[name_key] = ""
         if also_region_from_support_lead:
             st.session_state["region"] = ""
+
+
+def sync_person_row_fields(row: Dict[str, Any], maps: dict) -> Dict[str, Any]:
+    out = dict(row)
+    name_to_id = maps["name_to_id"]
+    id_to_name = maps["id_to_name"]
+    id_to_region = maps["id_to_region"]
+
+    def _sync_pair(id_key: str, name_key: str) -> None:
+        emp_id = _norm(out.get(id_key, ""))
+        emp_name = _norm(out.get(name_key, ""))
+
+        if emp_id:
+            if emp_id in id_to_name:
+                out[name_key] = id_to_name[emp_id]
+            return
+
+        if emp_name:
+            mapped_id = name_to_id.get(emp_name.lower())
+            if mapped_id:
+                out[id_key] = mapped_id
+
+    _sync_pair("project_manager_id", "project_manager_name")
+    _sync_pair("support_lead_id", "support_lead_name")
+    _sync_pair("responsible_analyst_id", "responsible_analyst_name")
+
+    support_lead_id = _norm(out.get("support_lead_id", ""))
+    if support_lead_id:
+        out["region"] = id_to_region.get(support_lead_id) or None
+    else:
+        support_lead_name = _norm(out.get("support_lead_name", ""))
+        mapped_id = name_to_id.get(support_lead_name.lower()) if support_lead_name else None
+        if mapped_id:
+            out["support_lead_id"] = mapped_id
+            out["region"] = id_to_region.get(mapped_id) or None
+        elif not support_lead_name:
+            out["region"] = None
+
+    return out
 
 
 # ============================================================
@@ -575,49 +715,60 @@ def get_master_df() -> pd.DataFrame:
 
 
 def update_master_fields_many(payload_rows: List[dict]) -> None:
-    payload_rows = [truncate_fields(row, FIELD_MAX_LENGTHS) for row in payload_rows]
+    payload_rows = [truncate_master_row_to_db_limits(truncate_fields(row, FIELD_MAX_LENGTHS)) for row in payload_rows]
+
+    candidate_cols = [
+        "jira_summary",
+        "qc_overall_status",
+        "qc_investigation_status",
+        "qc_investigator",
+        "pre_check_date",
+        "check_meeting_date",
+        "remediation_meeting_date",
+        "reference_id",
+        "reference_date",
+        "email_after_pre_check",
+        "email_after_check_meeting",
+        "project_manager_id",
+        "project_manager_name",
+        "support_lead_id",
+        "support_lead_name",
+        "responsible_analyst_id",
+        "responsible_analyst_name",
+        "region",
+        "completed_date",
+        "summary_of_findings",
+        "check_meeting_comments",
+        "remediation_meeting_comments",
+    ]
+
+    set_clauses: List[str] = []
+    for col in candidate_cols:
+        if not master_has_column(col):
+            continue
+        if col == "jira_summary":
+            set_clauses.append("jira_summary = COALESCE(:jira_summary, jira_summary)")
+        else:
+            set_clauses.append(f"{col} = :{col}")
+
+    if master_has_column("updated_at"):
+        set_clauses.append("updated_at = SYSUTCDATETIME()")
+    if master_has_column("updated_by"):
+        set_clauses.append("updated_by = :updated_by")
+
+    if not set_clauses:
+        return
+
     sql = f"""
         UPDATE {T_MASTER}
-           SET
-               jira_summary = COALESCE(:jira_summary, jira_summary),
-
-               qc_overall_status = :qc_overall_status,
-               qc_investigation_status = :qc_investigation_status,
-               qc_investigator = :qc_investigator,
-
-               pre_check_date = :pre_check_date,
-               check_meeting_date = :check_meeting_date,
-               remediation_meeting_date = :remediation_meeting_date,
-
-               reference_id = :reference_id,
-               reference_date = :reference_date,
-
-               email_after_pre_check = :email_after_pre_check,
-               email_after_check_meeting = :email_after_check_meeting,
-
-               project_manager_id = :project_manager_id,
-               project_manager_name = :project_manager_name,
-               support_lead_id = :support_lead_id,
-               support_lead_name = :support_lead_name,
-               responsible_analyst_id = :responsible_analyst_id,
-               responsible_analyst_name = :responsible_analyst_name,
-
-               region = :region,
-               completed_date = :completed_date,
-
-               summary_of_findings = :summary_of_findings,
-               check_meeting_comments = :check_meeting_comments,
-               remediation_meeting_comments = :remediation_meeting_comments,
-
-               updated_at = SYSUTCDATETIME(),
-               updated_by = :updated_by
+           SET {", ".join(set_clauses)}
          WHERE jira_id = :jira_id;
     """
+
     with engine.begin() as conn:
-        conn.execute(
-            text(sql),
-            [{**row, "updated_by": current_user()} for row in payload_rows],
-        )
+        stmt = text(sql)
+        for row in payload_rows:
+            conn.execute(stmt, truncate_master_row_to_db_limits({**row, "updated_by": current_user()}))
 
 def truncate_fields(row, field_max_lengths):
     for field, max_len in field_max_lengths.items():
@@ -630,7 +781,7 @@ def truncate_fields(row, field_max_lengths):
 def update_master_partial(jira_id: str, fields: Dict[str, Any]) -> None:
     """
     Partial update used by Detail view callbacks (auto-sync between ID/Name/Region etc.).
-    Updates only provided keys (from the allowed set), plus updated_at/updated_by.
+    Updates only provided keys (from the allowed set), plus updated_at/updated_by when present.
     """
     allowed = {
         "qc_overall_status",
@@ -656,24 +807,27 @@ def update_master_partial(jira_id: str, fields: Dict[str, Any]) -> None:
         "remediation_meeting_comments",
     }
 
-    fields = truncate_fields(fields, FIELD_MAX_LENGTHS)
-    cols = []
-    params = {"jira_id": jira_id, "updated_by": current_user()}
+    fields = truncate_master_row_to_db_limits(truncate_fields(fields, FIELD_MAX_LENGTHS))
+    cols: List[str] = []
+    params = truncate_master_row_to_db_limits({"jira_id": jira_id, "updated_by": current_user()})
 
     for k, v in fields.items():
-        if k not in allowed:
+        if k not in allowed or not master_has_column(k):
             continue
         cols.append(f"{k} = :{k}")
         params[k] = v
+
+    if master_has_column("updated_at"):
+        cols.append("updated_at = SYSUTCDATETIME()")
+    if master_has_column("updated_by"):
+        cols.append("updated_by = :updated_by")
 
     if not cols:
         return
 
     sql = f"""
         UPDATE {T_MASTER}
-           SET {", ".join(cols)},
-               updated_at = SYSUTCDATETIME(),
-               updated_by = :updated_by
+           SET {", ".join(cols)}
          WHERE jira_id = :jira_id;
     """
     exec_sql(sql, params)
@@ -780,7 +934,7 @@ def _apply_master_filters(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # MASTER GRID
 # ============================================================
-def build_master_grid(df_display: pd.DataFrame) -> pd.DataFrame:
+def build_master_grid(df_display: pd.DataFrame, display_to_internal: Dict[str, str]) -> pd.DataFrame:
     gb = GridOptionsBuilder.from_dataframe(df_display)
 
     gb.configure_default_column(
@@ -839,7 +993,12 @@ def build_master_grid(df_display: pd.DataFrame) -> pd.DataFrame:
     ]
     for c in editable_text_cols:
         if c in df_display.columns:
-            gb.configure_column(c, editable=True)
+            internal_col = display_to_internal.get(c)
+            max_len = get_effective_master_limit(internal_col) if internal_col else None
+            col_cfg = {"editable": True, "cellEditor": "agTextCellEditor"}
+            if max_len:
+                col_cfg["cellEditorParams"] = {"maxLength": int(max_len)}
+            gb.configure_column(c, **col_cfg)
 
     editable_date_cols = [
         "Reference Date",
@@ -1057,10 +1216,17 @@ def show_master_view() -> None:
     df_show = df_show.rename(columns=rename_map)
     df_show = clean_none_like(df_show)
 
+    display_to_internal = {v: k for k, v in rename_map.items()}
+    df_show = enforce_master_display_limits(df_show, display_to_internal)
+
     st.subheader("JIRA Master List")
 
     df_before_edit = df_show.copy(deep=True)
-    edited_df = build_master_grid(df_show)
+    edited_df = build_master_grid(df_show, display_to_internal)
+    edited_sanitized = enforce_master_display_limits(edited_df, display_to_internal)
+    if not edited_sanitized.equals(edited_df):
+        st.info("Some pasted text exceeded DB field limits and was automatically truncated.")
+    edited_df = edited_sanitized
 
     csave1, _ = st.columns([1, 6])
     with csave1:
@@ -1080,6 +1246,8 @@ def show_master_view() -> None:
             if changed.empty:
                 flash_success("No changes to save.")
                 st.rerun()
+
+            maps = get_employees_maps()
 
             payload_rows: List[dict] = []
             for _, r in changed.iterrows():
@@ -1112,6 +1280,9 @@ def show_master_view() -> None:
                     "remediation_meeting_comments": None,
                 }
 
+                # Autofill ID/Name/Region in master save path (mirrors detail-view behavior)
+                row = sync_person_row_fields(row, maps)
+
                 # Truncate fields before appending
                 row = truncate_fields(row, FIELD_MAX_LENGTHS)
                 payload_rows.append(row)
@@ -1120,36 +1291,39 @@ def show_master_view() -> None:
                 flash_success("No valid rows to save.")
                 st.rerun()
 
-            # Preserve long-text fields on bulk save
+            # Preserve long-text fields on bulk save (only if columns exist)
             jira_ids = [p["jira_id"] for p in payload_rows]
-            stmt = (
-                text(
-                    f"""
-                    SELECT jira_id, summary_of_findings, check_meeting_comments, remediation_meeting_comments
-                    FROM {T_MASTER}
-                    WHERE jira_id IN :jira_ids
-                    """
+            long_text_cols = [
+                c
+                for c in ["summary_of_findings", "check_meeting_comments", "remediation_meeting_comments"]
+                if master_has_column(c)
+            ]
+
+            if long_text_cols:
+                select_cols = ", ".join(["jira_id"] + long_text_cols)
+                stmt = (
+                    text(
+                        f"""
+                        SELECT {select_cols}
+                        FROM {T_MASTER}
+                        WHERE jira_id IN :jira_ids
+                        """
+                    )
+                    .bindparams(bindparam("jira_ids", expanding=True))
                 )
-                .bindparams(bindparam("jira_ids", expanding=True))
-            )
 
-            with engine.begin() as conn:
-                existing = pd.read_sql(stmt, conn, params={"jira_ids": jira_ids})
+                with engine.begin() as conn:
+                    existing = pd.read_sql(stmt, conn, params={"jira_ids": jira_ids})
 
-            existing_map = {
-                _norm(row["jira_id"]): {
-                    "summary_of_findings": row.get("summary_of_findings"),
-                    "check_meeting_comments": row.get("check_meeting_comments"),
-                    "remediation_meeting_comments": row.get("remediation_meeting_comments"),
+                existing_map = {
+                    _norm(row["jira_id"]): {col: row.get(col) for col in long_text_cols}
+                    for _, row in existing.iterrows()
                 }
-                for _, row in existing.iterrows()
-            }
 
-            for p in payload_rows:
-                keep = existing_map.get(p["jira_id"], {})
-                p["summary_of_findings"] = keep.get("summary_of_findings")
-                p["check_meeting_comments"] = keep.get("check_meeting_comments")
-                p["remediation_meeting_comments"] = keep.get("remediation_meeting_comments")
+                for p in payload_rows:
+                    keep = existing_map.get(p["jira_id"], {})
+                    for col in long_text_cols:
+                        p[col] = keep.get(col)
 
             payload_rows = [truncate_fields(row, FIELD_MAX_LENGTHS) for row in payload_rows]
 
