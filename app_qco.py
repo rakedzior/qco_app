@@ -380,6 +380,86 @@ def master_has_column(col: str) -> bool:
     return col in get_master_columns()
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def get_master_char_limits() -> Dict[str, int]:
+    try:
+        df = fetch_df(
+            """
+            SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = :schema
+              AND TABLE_NAME = :table
+              AND CHARACTER_MAXIMUM_LENGTH IS NOT NULL;
+            """,
+            {"schema": MASTER_SCHEMA, "table": MASTER_TABLE},
+        )
+        limits: Dict[str, int] = {}
+        for _, row in df.iterrows():
+            col = str(row.get("COLUMN_NAME") or "").strip()
+            max_len = row.get("CHARACTER_MAXIMUM_LENGTH")
+            if not col or max_len in (None, -1):
+                continue
+            try:
+                limits[col] = int(max_len)
+            except Exception:
+                continue
+        return limits
+    except Exception:
+        return {}
+
+
+def truncate_master_row_to_db_limits(row: Dict[str, Any]) -> Dict[str, Any]:
+    limits = get_master_char_limits()
+    if not limits:
+        return row
+
+    out = dict(row)
+    for field, val in out.items():
+        if not isinstance(val, str):
+            continue
+        db_max = limits.get(field)
+        cfg_max = FIELD_MAX_LENGTHS.get(field)
+
+        if db_max is None and cfg_max is None:
+            continue
+
+        effective_max = db_max if cfg_max is None else min(db_max or cfg_max, cfg_max)
+        if effective_max is not None and len(val) > effective_max:
+            print(f"Truncating field {field}: {len(val)} -> {effective_max}")
+            out[field] = val[:effective_max]
+
+    return out
+
+
+def get_effective_master_limit(col: str) -> Optional[int]:
+    db_max = get_master_char_limits().get(col)
+    cfg_max = FIELD_MAX_LENGTHS.get(col)
+
+    if db_max is None and cfg_max is None:
+        return None
+    if db_max is None:
+        return cfg_max
+    if cfg_max is None:
+        return db_max
+    return min(db_max, cfg_max)
+
+
+def enforce_master_display_limits(df_display: pd.DataFrame, display_to_internal: Dict[str, str]) -> pd.DataFrame:
+    out = df_display.copy()
+    for display_col, internal_col in display_to_internal.items():
+        if display_col not in out.columns:
+            continue
+        limit = get_effective_master_limit(internal_col)
+        if not limit:
+            continue
+
+        out[display_col] = out[display_col].apply(
+            lambda v: v if (not isinstance(v, str) or len(v) <= limit) else v[:limit]
+        )
+
+    return out
+
+
 def normalize_for_compare(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for c in out.columns:
@@ -596,7 +676,7 @@ def get_master_df() -> pd.DataFrame:
 
 
 def update_master_fields_many(payload_rows: List[dict]) -> None:
-    payload_rows = [truncate_fields(row, FIELD_MAX_LENGTHS) for row in payload_rows]
+    payload_rows = [truncate_master_row_to_db_limits(truncate_fields(row, FIELD_MAX_LENGTHS)) for row in payload_rows]
 
     candidate_cols = [
         "jira_summary",
@@ -647,7 +727,9 @@ def update_master_fields_many(payload_rows: List[dict]) -> None:
     """
 
     with engine.begin() as conn:
-        conn.execute(text(sql), [{**row, "updated_by": current_user()} for row in payload_rows])
+        stmt = text(sql)
+        for row in payload_rows:
+            conn.execute(stmt, truncate_master_row_to_db_limits({**row, "updated_by": current_user()}))
 
 def truncate_fields(row, field_max_lengths):
     for field, max_len in field_max_lengths.items():
@@ -686,9 +768,9 @@ def update_master_partial(jira_id: str, fields: Dict[str, Any]) -> None:
         "remediation_meeting_comments",
     }
 
-    fields = truncate_fields(fields, FIELD_MAX_LENGTHS)
+    fields = truncate_master_row_to_db_limits(truncate_fields(fields, FIELD_MAX_LENGTHS))
     cols: List[str] = []
-    params = {"jira_id": jira_id, "updated_by": current_user()}
+    params = truncate_master_row_to_db_limits({"jira_id": jira_id, "updated_by": current_user()})
 
     for k, v in fields.items():
         if k not in allowed or not master_has_column(k):
@@ -813,7 +895,7 @@ def _apply_master_filters(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # MASTER GRID
 # ============================================================
-def build_master_grid(df_display: pd.DataFrame) -> pd.DataFrame:
+def build_master_grid(df_display: pd.DataFrame, display_to_internal: Dict[str, str]) -> pd.DataFrame:
     gb = GridOptionsBuilder.from_dataframe(df_display)
 
     gb.configure_default_column(
@@ -872,7 +954,12 @@ def build_master_grid(df_display: pd.DataFrame) -> pd.DataFrame:
     ]
     for c in editable_text_cols:
         if c in df_display.columns:
-            gb.configure_column(c, editable=True)
+            internal_col = display_to_internal.get(c)
+            max_len = get_effective_master_limit(internal_col) if internal_col else None
+            col_cfg = {"editable": True, "cellEditor": "agTextCellEditor"}
+            if max_len:
+                col_cfg["cellEditorParams"] = {"maxLength": int(max_len)}
+            gb.configure_column(c, **col_cfg)
 
     editable_date_cols = [
         "Reference Date",
@@ -1090,10 +1177,17 @@ def show_master_view() -> None:
     df_show = df_show.rename(columns=rename_map)
     df_show = clean_none_like(df_show)
 
+    display_to_internal = {v: k for k, v in rename_map.items()}
+    df_show = enforce_master_display_limits(df_show, display_to_internal)
+
     st.subheader("JIRA Master List")
 
     df_before_edit = df_show.copy(deep=True)
-    edited_df = build_master_grid(df_show)
+    edited_df = build_master_grid(df_show, display_to_internal)
+    edited_sanitized = enforce_master_display_limits(edited_df, display_to_internal)
+    if not edited_sanitized.equals(edited_df):
+        st.info("Some pasted text exceeded DB field limits and was automatically truncated.")
+    edited_df = edited_sanitized
 
     csave1, _ = st.columns([1, 6])
     with csave1:
