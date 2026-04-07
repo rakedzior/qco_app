@@ -90,7 +90,7 @@ st.set_page_config(page_title="QC Governance", layout="wide")
 
  
 
-JIRA_BASE_URL = https://fcr-jira.systems.uk.hsbc/browse/
+JIRA_BASE_URL = "https://fcr-jira.systems.uk.hsbc/browse/"
 
 QC_INVESTIGATORS = ["Franek Grzybowski", "Hesam Khaksar", "Rafal Kedzior"]
 
@@ -1462,6 +1462,14 @@ class LinkRenderer {
 
 def ensure_grades_rows_for_jira(jira_id: str) -> None:
 
+    seeded_key = "detail_seeded_grades_by_jira"
+
+    seeded = st.session_state.setdefault(seeded_key, set())
+
+    if jira_id in seeded:
+
+        return
+
     exec_sql(
 
         f"""
@@ -1495,6 +1503,8 @@ def ensure_grades_rows_for_jira(jira_id: str) -> None:
         {"jira_id": jira_id, "updated_by": current_user()},
 
     )
+
+    seeded.add(jira_id)
 
  
 
@@ -3136,6 +3146,11 @@ def get_checks_for_jira(jira_id: str) -> pd.DataFrame:
 
  
 
+@st.cache_data(show_spinner=False, ttl=600)
+def get_all_jira_ids() -> List[str]:
+    return fetch_df(f"SELECT jira_id FROM {T_MASTER} ORDER BY jira_id")["jira_id"].astype(str).tolist()
+
+
 def _init_detail_checks_state(jira_id: str, df_checks: pd.DataFrame) -> pd.DataFrame:
 
     key_meta = "detail_checks_meta"
@@ -3243,6 +3258,13 @@ def build_checks_editor_grid(df_checks: pd.DataFrame) -> pd.DataFrame:
     grid_options = gb.build()
 
     grid_options["domLayout"] = "normal"
+    grid_options["cellSelection"] = True
+    grid_options["suppressClipboardPaste"] = False
+    grid_options["suppressCopyRowsToClipboard"] = False
+    grid_options["suppressLastEmptyLineOnPaste"] = True
+    grid_options["singleClickEdit"] = True
+    grid_options["stopEditingWhenCellsLoseFocus"] = True
+    grid_options["enableCellTextSelection"] = False
 
  
 
@@ -3264,7 +3286,7 @@ def build_checks_editor_grid(df_checks: pd.DataFrame) -> pd.DataFrame:
 
         key="detail_checks_grid",
 
-        update_on=["cellValueChanged"],
+        update_on=["pasteEnd"],
 
     )
 
@@ -3294,7 +3316,7 @@ def show_detail_view(jira_id: str) -> None:
 
         st.markdown("### Jump to another ticket")
 
-        all_ids = fetch_df(f"SELECT jira_id FROM {T_MASTER} ORDER BY jira_id")["jira_id"].astype(str).tolist()
+        all_ids = get_all_jira_ids()
 
         current_idx = all_ids.index(jira_id) if jira_id in all_ids else 0
 
@@ -3378,45 +3400,29 @@ def show_detail_view(jira_id: str) -> None:
 
  
 
-    def _save_people_fields():
+    def _current_people_row() -> Dict[str, Optional[str]]:
 
-        pm = _norm(st.session_state.get("project_manager_name")) or None
+        def _clean_name(key: str) -> Optional[str]:
 
-        sl = _norm(st.session_state.get("support_lead_name")) or None
+            name = _norm(st.session_state.get(key)) or None
 
-        ra = _norm(st.session_state.get("responsible_analyst_name")) or None
+            return name if (name and name.lower() in allowed) else None
 
- 
-
-        if pm and pm.lower() not in allowed:
-
-            pm = None
-
-        if sl and sl.lower() not in allowed:
-
-            sl = None
-
-        if ra and ra.lower() not in allowed:
-
-            ra = None
-
- 
-
-        row = sync_person_row_fields_prefer_name(
+        return sync_person_row_fields_prefer_name(
 
             {
 
                 "project_manager_id": None,
 
-                "project_manager_name": pm,
+                "project_manager_name": _clean_name("project_manager_name"),
 
                 "support_lead_id": None,
 
-                "support_lead_name": sl,
+                "support_lead_name": _clean_name("support_lead_name"),
 
                 "responsible_analyst_id": None,
 
-                "responsible_analyst_name": ra,
+                "responsible_analyst_name": _clean_name("responsible_analyst_name"),
 
                 "region": None,
 
@@ -3426,61 +3432,35 @@ def show_detail_view(jira_id: str) -> None:
 
         )
 
- 
 
-        update_master_partial(
 
-            jira_id,
+    def _sync_people_fields_in_state():
 
-            {
+        row = _current_people_row()
 
-                "project_manager_id": row.get("project_manager_id"),
+        for key in [
 
-                "project_manager_name": row.get("project_manager_name"),
+            "project_manager_id",
 
-                "support_lead_id": row.get("support_lead_id"),
+            "project_manager_name",
 
-                "support_lead_name": row.get("support_lead_name"),
+            "support_lead_id",
 
-                "responsible_analyst_id": row.get("responsible_analyst_id"),
+            "support_lead_name",
 
-                "responsible_analyst_name": row.get("responsible_analyst_name"),
+            "responsible_analyst_id",
 
-                "region": row.get("region"),
+            "responsible_analyst_name",
 
-            },
+            "region",
 
-        )
+        ]:
 
- 
+            st.session_state[key] = row.get(key) or ""
 
-        st.session_state["project_manager_id"] = row.get("project_manager_id") or ""
 
-        st.session_state["support_lead_id"] = row.get("support_lead_id") or ""
 
-        st.session_state["responsible_analyst_id"] = row.get("responsible_analyst_id") or ""
-
-        st.session_state["region"] = row.get("region") or ""
-
- 
-
-    def _on_pm_change():
-
-        run_sql_safely(_save_people_fields, "detail/people(pm)")
-
- 
-
-    def _on_sl_change():
-
-        run_sql_safely(_save_people_fields, "detail/people(sl)")
-
- 
-
-    def _on_ra_change():
-
-        run_sql_safely(_save_people_fields, "detail/people(ra)")
-
- 
+    _sync_people_fields_in_state()
 
     st.title(f"QC Details — {jira_id}")
 
@@ -3636,13 +3616,13 @@ def show_detail_view(jira_id: str) -> None:
 
         st.text_input("Project Manager ID", key="project_manager_id", disabled=True)
 
-        st.selectbox("Project Manager Name", options=names, key="project_manager_name", on_change=_on_pm_change)
+        st.selectbox("Project Manager Name", options=names, key="project_manager_name", on_change=_sync_people_fields_in_state)
 
     with p2:
 
         st.text_input("Support Lead ID", key="support_lead_id", disabled=True)
 
-        st.selectbox("Support Lead Name", options=names, key="support_lead_name", on_change=_on_sl_change)
+        st.selectbox("Support Lead Name", options=names, key="support_lead_name", on_change=_sync_people_fields_in_state)
 
         st.caption("Region auto-sync from Support Lead.")
 
@@ -3650,7 +3630,7 @@ def show_detail_view(jira_id: str) -> None:
 
         st.text_input("Responsible Analyst ID", key="responsible_analyst_id", disabled=True)
 
-        st.selectbox("Responsible Analyst Name", options=names, key="responsible_analyst_name", on_change=_on_ra_change)
+        st.selectbox("Responsible Analyst Name", options=names, key="responsible_analyst_name", on_change=_sync_people_fields_in_state)
 
  
 
@@ -3770,29 +3750,7 @@ def show_detail_view(jira_id: str) -> None:
 
         if st.button("Save", type="primary", use_container_width=True):
 
-            people = sync_person_row_fields_prefer_name(
-
-                {
-
-                    "project_manager_id": None,
-
-                    "project_manager_name": _norm(st.session_state.get("project_manager_name")) or None,
-
-                    "support_lead_id": None,
-
-                    "support_lead_name": _norm(st.session_state.get("support_lead_name")) or None,
-
-                    "responsible_analyst_id": None,
-
-                    "responsible_analyst_name": _norm(st.session_state.get("responsible_analyst_name")) or None,
-
-                    "region": None,
-
-                },
-
-                maps,
-
-            )
+            people = _current_people_row()
 
  
 
