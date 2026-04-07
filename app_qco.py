@@ -90,7 +90,7 @@ st.set_page_config(page_title="QC Governance", layout="wide")
 
  
 
-JIRA_BASE_URL = https://fcr-jira.systems.uk.hsbc/browse/
+JIRA_BASE_URL = "https://fcr-jira.systems.uk.hsbc/browse/"
 
 QC_INVESTIGATORS = ["Franek Grzybowski", "Hesam Khaksar", "Rafal Kedzior"]
 
@@ -3136,6 +3136,11 @@ def get_checks_for_jira(jira_id: str) -> pd.DataFrame:
 
  
 
+@st.cache_data(show_spinner=False, ttl=600)
+def get_all_jira_ids() -> List[str]:
+    return fetch_df(f"SELECT jira_id FROM {T_MASTER} ORDER BY jira_id")["jira_id"].astype(str).tolist()
+
+
 def _init_detail_checks_state(jira_id: str, df_checks: pd.DataFrame) -> pd.DataFrame:
 
     key_meta = "detail_checks_meta"
@@ -3243,6 +3248,13 @@ def build_checks_editor_grid(df_checks: pd.DataFrame) -> pd.DataFrame:
     grid_options = gb.build()
 
     grid_options["domLayout"] = "normal"
+    grid_options["cellSelection"] = True
+    grid_options["suppressClipboardPaste"] = False
+    grid_options["suppressCopyRowsToClipboard"] = False
+    grid_options["suppressLastEmptyLineOnPaste"] = True
+    grid_options["singleClickEdit"] = True
+    grid_options["stopEditingWhenCellsLoseFocus"] = True
+    grid_options["enableCellTextSelection"] = False
 
  
 
@@ -3264,7 +3276,7 @@ def build_checks_editor_grid(df_checks: pd.DataFrame) -> pd.DataFrame:
 
         key="detail_checks_grid",
 
-        update_on=["cellValueChanged"],
+        update_on=["pasteEnd"],
 
     )
 
@@ -3294,7 +3306,7 @@ def show_detail_view(jira_id: str) -> None:
 
         st.markdown("### Jump to another ticket")
 
-        all_ids = fetch_df(f"SELECT jira_id FROM {T_MASTER} ORDER BY jira_id")["jira_id"].astype(str).tolist()
+        all_ids = get_all_jira_ids()
 
         current_idx = all_ids.index(jira_id) if jira_id in all_ids else 0
 
@@ -3378,7 +3390,7 @@ def show_detail_view(jira_id: str) -> None:
 
  
 
-    def _save_people_fields():
+    def _sync_people_fields_in_state():
 
         pm = _norm(st.session_state.get("project_manager_name")) or None
 
@@ -3386,7 +3398,7 @@ def show_detail_view(jira_id: str) -> None:
 
         ra = _norm(st.session_state.get("responsible_analyst_name")) or None
 
- 
+
 
         if pm and pm.lower() not in allowed:
 
@@ -3400,7 +3412,7 @@ def show_detail_view(jira_id: str) -> None:
 
             ra = None
 
- 
+
 
         row = sync_person_row_fields_prefer_name(
 
@@ -3426,61 +3438,43 @@ def show_detail_view(jira_id: str) -> None:
 
         )
 
- 
 
-        update_master_partial(
-
-            jira_id,
-
-            {
-
-                "project_manager_id": row.get("project_manager_id"),
-
-                "project_manager_name": row.get("project_manager_name"),
-
-                "support_lead_id": row.get("support_lead_id"),
-
-                "support_lead_name": row.get("support_lead_name"),
-
-                "responsible_analyst_id": row.get("responsible_analyst_id"),
-
-                "responsible_analyst_name": row.get("responsible_analyst_name"),
-
-                "region": row.get("region"),
-
-            },
-
-        )
-
- 
 
         st.session_state["project_manager_id"] = row.get("project_manager_id") or ""
 
+        st.session_state["project_manager_name"] = row.get("project_manager_name") or ""
+
         st.session_state["support_lead_id"] = row.get("support_lead_id") or ""
+
+        st.session_state["support_lead_name"] = row.get("support_lead_name") or ""
 
         st.session_state["responsible_analyst_id"] = row.get("responsible_analyst_id") or ""
 
+        st.session_state["responsible_analyst_name"] = row.get("responsible_analyst_name") or ""
+
         st.session_state["region"] = row.get("region") or ""
 
- 
+
 
     def _on_pm_change():
 
-        run_sql_safely(_save_people_fields, "detail/people(pm)")
+        _sync_people_fields_in_state()
 
- 
+
 
     def _on_sl_change():
 
-        run_sql_safely(_save_people_fields, "detail/people(sl)")
+        _sync_people_fields_in_state()
 
- 
+
 
     def _on_ra_change():
 
-        run_sql_safely(_save_people_fields, "detail/people(ra)")
+        _sync_people_fields_in_state()
 
- 
+
+
+    _sync_people_fields_in_state()
 
     st.title(f"QC Details — {jira_id}")
 
